@@ -4,7 +4,7 @@ services:
     env_file: .env
     restart: unless-stopped
     init: true
-    mem_limit: 768m
+    mem_limit: 1024m
     cpus: 0.65
     pids_limit: 512
     shm_size: 128m
