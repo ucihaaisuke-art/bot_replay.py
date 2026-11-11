@@ -11,10 +11,11 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from collections import deque
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from PIL import Image
+from PIL import Image, ImageGrab, ImageChops
 from playwright.async_api import async_playwright
 from telegram import InputFile
 from telegram.error import NetworkError, RetryAfter, TelegramError
@@ -52,7 +53,27 @@ def replay_url(text):
 
 def ending_text(text):
     normalized = re.sub(r"[^A-Z]", "", text.upper().replace("0", "O").replace("1", "I").replace("|", "I"))
-    return "TONTONLAGI" in normalized and "SALINTAUTAN" in normalized
+    return any(value in normalized for value in ("TONTONLAGI", "WATCHAGAIN", "PLAYAGAIN")) and any(
+        value in normalized for value in ("SALINTAUTAN", "COPYLINK"))
+
+
+def continuation_text(text):
+    normalized = re.sub(r"[^A-Z]", "", text.upper().replace("0", "O").replace("1", "I").replace("|", "I"))
+    if any(value in normalized for value in ("TONTONLAGI", "WATCHAGAIN", "PLAYAGAIN", "SALINTAUTAN", "COPYLINK")):
+        return False
+    phrases = (
+        "TEKANDIMANASAJAUNTUKMELANJUTKAN", "KLIKDIMANASAJAUNTUKMELANJUTKAN",
+        "KETUKDIMANASAJAUNTUKMELANJUTKAN", "PRESSANYWHERETOCONTINUE",
+        "CLICKANYWHERETOCONTINUE", "TAPANYWHERETOCONTINUE")
+    if any(value in normalized for value in phrases):
+        return True
+    for match in re.finditer(r"TEKAN|KLIK|KETUK|PRESS|CLICK|TAP", normalized):
+        for phrase in phrases:
+            for size in (len(phrase) - 1, len(phrase), len(phrase) + 1):
+                candidate = normalized[match.start():match.start() + size]
+                if SequenceMatcher(None, candidate, phrase).ratio() >= .92:
+                    return True
+    return False
 
 
 async def stop_process(process):
@@ -165,21 +186,98 @@ class PublicRequests:
             await route.abort()
 
 
+def capture_screen_png():
+    """Ambil piksel Xvfb langsung tanpa menunggu screenshot browser."""
+    with ImageGrab.grab(xdisplay=":99") as image:
+        if image.size != (WIDTH, HEIGHT):
+            raise ReplayError("Ukuran layar perekam belum sesuai dengan video portrait.")
+        output = io.BytesIO()
+        image.save(output, format="PNG", compress_level=1)
+        return output.getvalue()
+
+
+def popup_ocr_image(picture):
+    with Image.open(io.BytesIO(picture)) as image:
+        left, top = int(WIDTH * .05), int(HEIGHT * .20)
+        crop = image.convert("RGB").crop((left, top, int(WIDTH * .95), int(HEIGHT * .72)))
+        red, green, blue = crop.split()
+        white = ImageChops.darker(ImageChops.darker(red, green), blue)
+        mask = white.point(lambda value: 0 if value >= 160 else 255)
+        mask = mask.resize((mask.width * 2, mask.height * 2), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        mask.save(output, format="PNG", compress_level=1)
+        return output.getvalue(), left, top
+
+
+async def read_popup_text(picture):
+    processed, left, top = await asyncio.to_thread(popup_ocr_image, picture)
+    output, _ = await command("tesseract", "stdin", "stdout", "-l", "eng", "--psm", "6", "tsv", input=processed)
+    words, position, rank = [], None, 0
+    for line in output.decode("utf-8", errors="replace").splitlines()[1:]:
+        row = line.split("\t", 11)
+        if len(row) != 12 or not row[11].strip():
+            continue
+        words.append(row[11])
+        word = re.sub(r"[^A-Z]", "", row[11].upper())
+        priority = {"MELANJUTKAN": 3, "CONTINUE": 3, "UNTUK": 2, "ANYWHERE": 2,
+                    "TEKAN": 1, "KLIK": 1, "KETUK": 1, "PRESS": 1, "CLICK": 1, "TAP": 1}.get(word, 0)
+        if priority and priority >= rank:
+            try:
+                x, y, width, height = map(int, row[6:10])
+                position = (left + (x + width / 2) / 2, top + (y + height / 2) / 2)
+                rank = priority
+            except ValueError:
+                pass
+    return " ".join(words), position
+
+
+async def inspect_popup(page, picture, base_text):
+    state = getattr(page, "_replay_popup_state", None)
+    if state is None:
+        state = dict(scan=-100.0, click=-100.0, hits=0, end_seen=False)
+        page._replay_popup_state = state
+    now = time.monotonic()
+    if now - state["scan"] < 6 and not state["end_seen"]:
+        return False
+    state["scan"] = now
+    extra, position = await read_popup_text(picture)
+    text = base_text + "\n" + extra
+    if ending_text(text):
+        state["end_seen"] = True
+        return True
+    state["end_seen"] = False
+    if not continuation_text(text):
+        state["hits"] = 0
+        return False
+    state["hits"] += 1
+    if state["hits"] >= 2 and now - state["click"] >= 10:
+        if position is None:
+            LOG.info("Instruksi lanjut terbaca, tetapi posisi teks belum pasti; klik dilewati.")
+            return False
+        await page.mouse.click(*position)
+        state["hits"], state["click"] = 0, time.monotonic()
+        LOG.info("Popup replay dilanjutkan: instruksi eksplisit terdeteksi pada dua pemeriksaan.")
+    return False
+
+
 async def end_visible(page, *, ocr=True):
     """Periksa DOM dan screenshot: tombol game dapat digambar di dalam canvas."""
     for frame in page.frames:
         try:
-            again = frame.get_by_text(re.compile(r"^\s*TONTON\s+LAGI\s*$", re.I)).first
-            share = frame.get_by_text(re.compile(r"^\s*SALIN\s+TAUTAN\s*$", re.I)).first
+            again = frame.get_by_text(re.compile(r"^\s*(?:TONTON\s+LAGI|WATCH\s+AGAIN|PLAY\s+AGAIN)\s*$", re.I)).first
+            share = frame.get_by_text(re.compile(r"^\s*(?:SALIN\s+TAUTAN|COPY\s+LINK)\s*$", re.I)).first
             if await again.is_visible() and await share.is_visible():
                 return True
         except Exception:
             continue
     if not ocr:
         return False
-    screenshot = await page.screenshot(timeout=10000)
+    screenshot = await asyncio.to_thread(capture_screen_png)
     result, _ = await command("tesseract", "stdin", "stdout", "-l", "eng", "--psm", "11", input=screenshot)
-    return ending_text(result.decode("utf-8", errors="replace"))
+    text = result.decode("utf-8", errors="replace")
+    if ending_text(text):
+        return True
+    return await inspect_popup(page, screenshot, text)
 
 
 async def unmute(page, env):
@@ -195,7 +293,7 @@ async def unmute(page, env):
         if await button.is_visible():
             await button.click(timeout=3000)
             return
-    screenshot = await page.screenshot(timeout=10000)
+    screenshot = await asyncio.to_thread(capture_screen_png)
     with Image.open(io.BytesIO(screenshot)) as image:
         thumb = image.convert("RGB").resize((72, 128))
         rows = []
@@ -425,6 +523,29 @@ class ReplayBot:
         except TelegramError:
             pass
 
+    async def look(self, update, context):
+        if not self.authorized(update):
+            return
+        message = update.effective_message
+        job = self.current
+        if job is None or job[0] != update.effective_user.id:
+            await message.reply_text("Pakai /lihat saat replay milikmu sedang direkam, le.")
+            return
+        try:
+            picture = await asyncio.to_thread(capture_screen_png)
+            text, _ = await command("tesseract", "stdin", "stdout", "-l", "eng", "--psm", "11", input=picture)
+            if self.current is not job:
+                await message.reply_text("Permintaanmu sudah selesai atau beralih; coba /lihat saat rekamanmu aktif.")
+                return
+            await message.reply_photo(InputFile(picture, filename="tampilan-replay.png"),
+                                      caption="Tampilan yang sedang dilihat bot untuk replaymu.",
+                                      read_timeout=60, write_timeout=60)
+            reading = text.decode("utf-8", errors="replace").strip() or "(Belum ada teks yang terbaca.)"
+            await message.reply_text("Teks yang terbaca:\n" + reading[:3000], parse_mode=None)
+        except Exception:
+            LOG.exception("Pemeriksaan layar replay gagal")
+            await self.notify(message, "Layar perekam belum bisa diambil, le. Coba /lihat lagi sebentar atau periksa log.")
+
     async def cancel(self, update, context):
         if self.authorized(update):
             user = update.effective_user.id
@@ -457,6 +578,7 @@ def main():
     app = Application.builder().token(token).post_stop(bot.stop).post_shutdown(bot.stop).build()
     app.add_handler(CommandHandler("start", bot.start))
     app.add_handler(CommandHandler("batal", bot.cancel))
+    app.add_handler(CommandHandler("lihat", bot.look))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, bot.receive))
     app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
 
